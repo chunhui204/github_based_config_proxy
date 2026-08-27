@@ -260,9 +260,9 @@ docker compose up -d --build
 
 #### 方式 D：GitHub Actions 自动部署
 
-1. 在代码仓库 Settings → Secrets and variables → Actions 中添加以下 Secrets：
+1. 在代码仓库 **Settings → Secrets and variables → Actions** 中分别配置：
 
-   **服务器连接：**
+   **Secrets（加密，用于敏感信息）：**
 
    | Secret 名 | 说明 |
    |-----------|------|
@@ -270,25 +270,27 @@ docker compose up -d --build
    | DEPLOY_USER | SSH 用户名，如 `root` |
    | DEPLOY_SSH_KEY | SSH 私钥内容（`cat ~/.ssh/id_rsa`） |
    | DEPLOY_PORT | SSH 端口，默认 22（可选） |
-   | DEPLOY_PORTS | 宿主机端口列表，逗号分隔，如 `11999,12000`，每个端口启动一个容器实例（可选，默认 `8080`） |
+   | MYSQL_PASSWORD | MySQL 密码 |
 
-   **MySQL 连接（部署时自动生成 config/server.json，不会提交到仓库）：**
+   **Variables（明文，用于非敏感配置）：**
 
-   | Secret 名 | 说明 |
+   | Variable 名 | 说明 |
    |-----------|------|
+   | DEPLOY_PORTS | 宿主机端口列表，逗号分隔，如 `11999,12000`，每个端口启动一个容器实例（可选，默认 `8080`） |
    | MYSQL_HOST | MySQL 主机地址 |
    | MYSQL_PORT | MySQL 端口，如 `3306` |
    | MYSQL_USER | MySQL 用户名 |
-   | MYSQL_PASSWORD | MySQL 密码 |
    | MYSQL_DB | MySQL 数据库名 |
 
 2. 代码推送到 `master` 分支自动触发部署，workflow 会：
    - scp 代码到服务器 `/opt/ads-dynamic-config`
-   - 根据 MySQL Secrets 动态生成 `config/server.json`
+   - 根据 Variables/Secrets 动态生成 `config/server.json`
    - docker build 构建镜像
    - 按 `DEPLOY_PORTS` 端口数量启动对应数量的容器，实例名自动为 `config-server-1`、`config-server-2`...
 
 > **注意：** `config/server.json` 已加入 `.gitignore`，不会将数据库密码提交到代码仓库。本地开发时可参考 `config/server.json.example` 创建该文件。
+>
+> **Variables vs Secrets**：Variables 为明文存储，仓库协作者可见，适合放 host、port、用户名等非敏感项；Secrets 为加密存储，日志中自动打码，密码和 SSH 私钥等敏感信息必须使用 Secrets。
 
 ### 第五步：验证部署
 

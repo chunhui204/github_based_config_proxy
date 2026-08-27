@@ -24,15 +24,16 @@ jobs:
 
       - name: Build and restart on remote server
         uses: appleboy/ssh-action@v1.0.3
-        # 通过 envs 将 GitHub Secrets 安全传递到远程 shell 脚本，
-        # 避免在脚本文本中直接拼接敏感信息
+        # 通过 envs 将配置安全传递到远程 shell 脚本。
+        # 非敏感项用 Variables（明文，仓库 Settings → Variables），
+        # 密码用 Secrets（加密，日志自动打码）
         env:
-          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
-          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
-          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_HOST: ${{ vars.MYSQL_HOST }}
+          MYSQL_PORT: ${{ vars.MYSQL_PORT }}
+          MYSQL_USER: ${{ vars.MYSQL_USER }}
           MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
-          MYSQL_DB: ${{ secrets.MYSQL_DB }}
-          DEPLOY_PORTS: ${{ secrets.DEPLOY_PORTS }}
+          MYSQL_DB: ${{ vars.MYSQL_DB }}
+          DEPLOY_PORTS: ${{ vars.DEPLOY_PORTS }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
@@ -52,7 +53,7 @@ jobs:
             mv $TMP_DIR $APP_DIR
             cd $APP_DIR
 
-            # 从 GitHub Secrets 动态生成 MySQL 配置文件
+            # 从 GitHub Variables/Secrets 动态生成 MySQL 配置文件
             mkdir -p config
             cat > config/server.json << EOF
             {
