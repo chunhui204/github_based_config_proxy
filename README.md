@@ -266,16 +266,16 @@ docker compose up -d --build
 
    | Secret 名 | 说明 |
    |-----------|------|
-   | DEPLOY_HOST | 部署服务器 IP |
-   | DEPLOY_USER | SSH 用户名，如 `root` |
    | DEPLOY_SSH_KEY | SSH 私钥内容（`cat ~/.ssh/id_rsa`） |
-   | DEPLOY_PORT | SSH 端口，默认 22（可选） |
    | MYSQL_PASSWORD | MySQL 密码 |
 
    **Variables（明文，用于非敏感配置）：**
 
    | Variable 名 | 说明 |
    |-----------|------|
+   | DEPLOY_HOST | 部署服务器 IP |
+   | DEPLOY_USER | SSH 用户名，如 `root` |
+   | DEPLOY_PORT | SSH 端口，默认 22（可选） |
    | DEPLOY_PORTS | 宿主机端口列表，逗号分隔，如 `11999,12000`，每个端口启动一个容器实例（可选，默认 `8080`） |
    | MYSQL_HOST | MySQL 主机地址 |
    | MYSQL_PORT | MySQL 端口，如 `3306` |
