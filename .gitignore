@@ -1,9 +1,9 @@
 .git
 .trae
-bin
 .tools
+bin
 local_verify.log
 local_verify.pid
+config/server.json
 *.md
 !README.md
-

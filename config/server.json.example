@@ -1,11 +1,11 @@
 {
   "database": {
     "type": "mysql",
-    "host": "8.222.145.95",
+    "host": "YOUR_MYSQL_HOST",
     "port": 3306,
-    "user": "hertz_user",
-    "password": "HertzUserPass123!",
-    "db_name": "hertz_db",
+    "user": "YOUR_MYSQL_USER",
+    "password": "YOUR_MYSQL_PASSWORD",
+    "db_name": "YOUR_MYSQL_DB",
     "max_open_conns": 100,
     "max_idle_conns": 20,
     "conn_max_lifetime": "30m"

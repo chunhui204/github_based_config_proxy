@@ -179,19 +179,23 @@ VALUES
 ON DUPLICATE KEY UPDATE META_VALUE = VALUES(META_VALUE);
 ```
 
-### 第三步：修改 config/server.json
+### 第三步：准备 config/server.json
 
-编辑 `config/server.json`，填入 MySQL 连接信息：
+复制模板并填入 MySQL 连接信息（`config/server.json` 已在 `.gitignore` 中，不会提交密码）：
+
+```bash
+cp config/server.json.example config/server.json
+```
 
 ```json
 {
   "database": {
     "type": "mysql",
-    "host": "8.222.145.95",
+    "host": "YOUR_MYSQL_HOST",
     "port": 3306,
-    "user": "hertz_user",
-    "password": "HertzUserPass123!",
-    "db_name": "hertz_db",
+    "user": "YOUR_MYSQL_USER",
+    "password": "YOUR_MYSQL_PASSWORD",
+    "db_name": "YOUR_MYSQL_DB",
     "max_open_conns": 100,
     "max_idle_conns": 20,
     "conn_max_lifetime": "30m"
@@ -256,20 +260,35 @@ docker compose up -d --build
 
 #### 方式 D：GitHub Actions 自动部署
 
-1. 在配置仓库（代码仓库）Settings → Secrets and variables → Actions 中添加：
+1. 在代码仓库 Settings → Secrets and variables → Actions 中添加以下 Secrets：
 
-| Secret 名 | 说明 |
-|-----------|------|
-| DEPLOY_HOST | 部署服务器 IP |
-| DEPLOY_USER | SSH 用户名，如 `root` |
-| DEPLOY_SSH_KEY | SSH 私钥内容（`cat ~/.ssh/id_rsa`） |
-| DEPLOY_PORT | SSH 端口，默认 22（可选） |
-| DEPLOY_PORTS | 宿主机端口列表，逗号分隔，如 `11999,12000`，每个端口启动一个容器实例（可选，默认 `8080`） |
+   **服务器连接：**
 
-2. 代码推送到 `main` 分支自动触发部署，workflow 会：
+   | Secret 名 | 说明 |
+   |-----------|------|
+   | DEPLOY_HOST | 部署服务器 IP |
+   | DEPLOY_USER | SSH 用户名，如 `root` |
+   | DEPLOY_SSH_KEY | SSH 私钥内容（`cat ~/.ssh/id_rsa`） |
+   | DEPLOY_PORT | SSH 端口，默认 22（可选） |
+   | DEPLOY_PORTS | 宿主机端口列表，逗号分隔，如 `11999,12000`，每个端口启动一个容器实例（可选，默认 `8080`） |
+
+   **MySQL 连接（部署时自动生成 config/server.json，不会提交到仓库）：**
+
+   | Secret 名 | 说明 |
+   |-----------|------|
+   | MYSQL_HOST | MySQL 主机地址 |
+   | MYSQL_PORT | MySQL 端口，如 `3306` |
+   | MYSQL_USER | MySQL 用户名 |
+   | MYSQL_PASSWORD | MySQL 密码 |
+   | MYSQL_DB | MySQL 数据库名 |
+
+2. 代码推送到 `master` 分支自动触发部署，workflow 会：
    - scp 代码到服务器 `/opt/ads-dynamic-config`
+   - 根据 MySQL Secrets 动态生成 `config/server.json`
    - docker build 构建镜像
    - 按 `DEPLOY_PORTS` 端口数量启动对应数量的容器，实例名自动为 `config-server-1`、`config-server-2`...
+
+> **注意：** `config/server.json` 已加入 `.gitignore`，不会将数据库密码提交到代码仓库。本地开发时可参考 `config/server.json.example` 创建该文件。
 
 ### 第五步：验证部署
 
@@ -505,7 +524,8 @@ workflow 文件内容见本仓库 [.github/workflows/config-repo-validate.yml](.
 ├── server/              # Server 同步逻辑、MySQL 存储、GitHub API 客户端
 ├── client_sdk/          # Go Client SDK
 ├── config/
-│   └── server.json      # MySQL 连接配置文件（部署时修改）
+│   ├── server.json.example   # MySQL 连接配置模板（参考）
+│   └── server.json           # 实际配置文件（.gitignore，不提交到仓库）
 ├── .github/workflows/
 │   ├── deploy.yml                  # Server 自动部署 workflow
 │   └── config-repo-validate.yml    # 配置仓库 JSON 校验 workflow（复制到配置仓库）

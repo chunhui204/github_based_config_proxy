@@ -2,7 +2,7 @@ name: Build and Deploy Config Server
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
 
 jobs:
   deploy:
@@ -24,11 +24,21 @@ jobs:
 
       - name: Build and restart on remote server
         uses: appleboy/ssh-action@v1.0.3
+        # 通过 envs 将 GitHub Secrets 安全传递到远程 shell 脚本，
+        # 避免在脚本文本中直接拼接敏感信息
+        env:
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DB: ${{ secrets.MYSQL_DB }}
+          DEPLOY_PORTS: ${{ secrets.DEPLOY_PORTS }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: ${{ secrets.DEPLOY_PORT || 22 }}
+          envs: MYSQL_HOST,MYSQL_PORT,MYSQL_USER,MYSQL_PASSWORD,MYSQL_DB,DEPLOY_PORTS
           script: |
             set -e
 
@@ -42,16 +52,28 @@ jobs:
             mv $TMP_DIR $APP_DIR
             cd $APP_DIR
 
-            # 检查配置文件
-            if [ ! -f config/server.json ]; then
-                echo "ERROR: config/server.json not found"
-                echo "Please create config/server.json with correct MySQL settings first"
-                exit 1
-            fi
+            # 从 GitHub Secrets 动态生成 MySQL 配置文件
+            mkdir -p config
+            cat > config/server.json << EOF
+            {
+              "database": {
+                "type": "mysql",
+                "host": "$MYSQL_HOST",
+                "port": $MYSQL_PORT,
+                "user": "$MYSQL_USER",
+                "password": "$MYSQL_PASSWORD",
+                "db_name": "$MYSQL_DB",
+                "max_open_conns": 100,
+                "max_idle_conns": 20,
+                "conn_max_lifetime": "30m"
+              }
+            }
+            EOF
+            echo "Generated config/server.json from GitHub Secrets"
 
             # 解析端口列表 DEPLOY_PORTS，格式: "11999,12000,12001"
             # 每个宿主机端口对应一个容器实例，容器内固定8080
-            PORTS_STR="${{ secrets.DEPLOY_PORTS }}"
+            PORTS_STR="$DEPLOY_PORTS"
             if [ -z "$PORTS_STR" ]; then
                 PORTS_STR="8080"
             fi
