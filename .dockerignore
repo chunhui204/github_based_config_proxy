@@ -1,0 +1,6 @@
+.git
+.trae
+bin
+local_verify.log
+local_verify.pid
+*.md

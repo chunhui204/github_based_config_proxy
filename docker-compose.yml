@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  config-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ads-dynamic-config-server:latest
+    container_name: ${INSTANCE_NAME:-config-server}
+    restart: always
+    environment:
+      - INSTANCE_NAME=${INSTANCE_NAME:-config-server}
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - ./config:/app/config
+    networks:
+      - config-network
+
+networks:
+  config-network:
+    driver: bridge

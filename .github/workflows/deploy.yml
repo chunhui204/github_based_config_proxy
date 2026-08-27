@@ -1,0 +1,111 @@
+name: Build and Deploy Config Server
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Copy code to remote server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          source: "."
+          target: "/opt/ads-dynamic-config-tmp"
+          overwrite: true
+
+      - name: Build and restart on remote server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            set -e
+
+            APP_DIR=/opt/ads-dynamic-config
+            TMP_DIR=/opt/ads-dynamic-config-tmp
+            IMAGE_NAME=ads-dynamic-config-server:latest
+            BASE_CONTAINER_NAME=config-server
+
+            # 移动新代码
+            rm -rf $APP_DIR
+            mv $TMP_DIR $APP_DIR
+            cd $APP_DIR
+
+            # 检查配置文件
+            if [ ! -f config/server.json ]; then
+                echo "ERROR: config/server.json not found"
+                echo "Please create config/server.json with correct MySQL settings first"
+                exit 1
+            fi
+
+            # 解析端口列表 DEPLOY_PORTS，格式: "11999,12000,12001"
+            # 每个宿主机端口对应一个容器实例，容器内固定8080
+            PORTS_STR="${{ secrets.DEPLOY_PORTS }}"
+            if [ -z "$PORTS_STR" ]; then
+                PORTS_STR="8080"
+            fi
+
+            echo "Deploy ports: $PORTS_STR"
+
+            # 构建镜像（只构建一次）
+            docker build -t $IMAGE_NAME .
+
+            # 按端口逐个启动/更新容器
+            IFS=',' read -ra PORTS <<< "$PORTS_STR"
+            INSTANCE_INDEX=1
+            for port in "${PORTS[@]}"; do
+                port=$(echo "$port" | xargs)
+                if [ -z "$port" ]; then
+                    continue
+                fi
+
+                CONTAINER_NAME="${BASE_CONTAINER_NAME}-${INSTANCE_INDEX}"
+                echo ""
+                echo "=== Starting $CONTAINER_NAME on host port $port ==="
+
+                # 停止并删除旧容器
+                docker rm -f $CONTAINER_NAME 2>/dev/null || true
+
+                # 启动新容器
+                docker run -d \
+                  --name $CONTAINER_NAME \
+                  --restart always \
+                  -p $port:8080 \
+                  -e INSTANCE_NAME=$CONTAINER_NAME \
+                  -v $APP_DIR/config:/app/config \
+                  $IMAGE_NAME
+
+                INSTANCE_INDEX=$((INSTANCE_INDEX + 1))
+            done
+
+            # 等待启动
+            sleep 5
+
+            # 检查所有实例状态
+            echo ""
+            echo "=== All containers status ==="
+            docker ps --filter name=$BASE_CONTAINER_NAME
+
+            # 健康检查第一个实例
+            FIRST_PORT=$(echo "$PORTS_STR" | cut -d',' -f1 | xargs)
+            echo ""
+            echo "=== Health check on port $FIRST_PORT ==="
+            curl -s http://127.0.0.1:$FIRST_PORT/health || true
+            echo ""
+
+            # 打印第一个实例日志
+            FIRST_CONTAINER="${BASE_CONTAINER_NAME}-1"
+            echo ""
+            echo "=== $FIRST_CONTAINER recent logs ==="
+            docker logs --tail 50 $FIRST_CONTAINER 2>&1 || true
