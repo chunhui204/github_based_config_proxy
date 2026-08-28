@@ -1,6 +1,6 @@
 # ADS 动态配置中心
 
-基于 GitHub 私有仓库 + MySQL 的分布式配置中心，支持多实例部署、配置热更新、本地缓存降级。
+基于 GitHub 私有仓库 + MySQL 的分布式配置中心，支持多实例部署、Server 本地缓存、Client HTTP 拉取、配置热更新、多级降级。
 
 ## 整体架构
 
@@ -8,13 +8,16 @@
 GitHub 私有仓库 (配置编辑入口)
        │
        ▼
-Config Server 集群 (MySQL lease 选主，单实例同步)
+Config Server 集群
+├── Leader 实例：定期拉取 GitHub，写入 MySQL（MySQL lease 选主）
+├── 所有实例：定期从 MySQL 加载配置到本地内存缓存
+└── HTTP API：对外提供配置查询（只读本地缓存，不直连 MySQL/GitHub）
        │
        ▼
-MySQL (持久化存储)
-       │
-       ▼
-Client SDK (本地缓存，轻量版本检查)
+Client SDK
+├── 通过 HTTP 请求 Server 获取配置（多节点轮询 + 故障转移）
+├── 本地缓存配置，定期轻量检查版本号
+└── Server 全挂时自动降级使用本地旧缓存
        │
        ▼
 业务服务
@@ -23,9 +26,12 @@ Client SDK (本地缓存，轻量版本检查)
 **核心工作流**：
 1. 运维在 GitHub 私有仓库编辑配置文件（JSON 格式），提交 PR 合入 main 分支
 2. Config Server 集群中只有抢到 Leader 锁的实例定期拉取 GitHub 配置，写入 MySQL
-3. MySQL 保存当前配置内容和全局版本号（GitHub commit SHA）
-4. Client SDK 本地缓存配置，定期轻量检查版本号，有变化才全量刷新
-5. MySQL 故障时 SDK 自动降级使用本地旧缓存，业务无感知
+3. **所有** Server 实例（包括 Follower）定期从 MySQL 加载配置到本地内存缓存
+4. Client SDK 通过 HTTP 请求 Server 获取配置，支持多节点轮询和故障转移
+5. Client SDK 本地缓存配置，定期轻量检查版本号，有变化才全量刷新
+6. Server 或 MySQL 故障时，Client SDK 自动降级使用本地旧缓存，业务无感知
+
+**Server 本地模式**（开发调试用）：`--mode=local` 启动时跳过 MySQL 和选主，直接从 GitHub 拉取配置到内存缓存，适合本地开发环境。
 
 ---
 
@@ -65,6 +71,7 @@ Client SDK (本地缓存，轻量版本检查)
 | GITHUB_BASE_URL | GitHub API 地址，默认 `https://api.github.com` |
 | SYNC_INTERVAL | Server 同步间隔，如 `1m` |
 | LOCK_LEASE_TTL | Leader 锁租约时长，如 `2m` |
+| CACHE_REFRESH_INTERVAL | Server 本地缓存从 MySQL 刷新间隔，如 `10s`（默认 10s） |
 | CLIENT_REFRESH_INTERVAL | Client 后台刷新检查间隔，如 `1m` |
 | CLIENT_MAX_CACHE_TTL | Client 本地缓存最大有效期，如 `5m` |
 
@@ -174,6 +181,7 @@ VALUES
 ('GITHUB_BASE_URL', 'https://api.github.com'),
 ('SYNC_INTERVAL', '1m'),
 ('LOCK_LEASE_TTL', '2m'),
+('CACHE_REFRESH_INTERVAL', '10s'),
 ('CLIENT_REFRESH_INTERVAL', '1m'),
 ('CLIENT_MAX_CACHE_TTL', '5m')
 ON DUPLICATE KEY UPDATE META_VALUE = VALUES(META_VALUE);
@@ -299,13 +307,102 @@ docker compose up -d --build
 curl http://服务器IP:8080/health
 # 返回 ok
 
+# 查看当前仓库版本
+curl http://服务器IP:8080/api/v1/version
+# 返回 {"repo_version":"<commit-sha>"}
+
+# 查询单个配置
+curl "http://服务器IP:8080/api/v1/config?namespace=payment&key=risk.json"
+# 返回配置文件原始内容
+
+# 全量快照
+curl http://服务器IP:8080/api/v1/snapshot
+
 # 查看日志
 docker logs -f config-server-1
 # 正常输出：
 # mysql connected: 8.222.145.95:3306/hertz_db
-# config sync server started, instance_name=config-server-1, sync_interval=1m0s, lock_ttl=2m0s
-# http server listening on :8080
+# running in MYSQL mode: instance_name=config-server-1, sync_interval=1m0s, lock_ttl=2m0s
+# cache refreshed: version=<sha> items=N
+# http server listening on :8080 (cache_refresh_interval=10s)
 ```
+
+---
+
+## Server HTTP API
+
+所有接口从 Server 本地内存缓存读取，不直连 MySQL/GitHub，响应延迟极低。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/health` | 健康检查，返回 `ok` |
+| GET | `/api/v1/version` | 返回当前缓存的仓库版本号 `{"repo_version":"<sha>"}` |
+| GET | `/api/v1/meta` | 返回 Client 侧刷新参数 `{"refresh_interval":"1m0s","max_cache_ttl":"5m0s"}` |
+| GET | `/api/v1/config?namespace=<ns>&key=<key>` | 返回单个配置项的原始文本内容；不存在返回 404 |
+| GET | `/api/v1/snapshot` | 返回全量配置快照 JSON（含 repo_version 和 items 数组） |
+
+**`/api/v1/snapshot` 响应示例**：
+```json
+{
+  "repo_version": "a1b2c3d4e5f6",
+  "items": [
+    {"namespace": "payment", "config_key": "risk.json", "value": "{\"enabled\":true}", "deleted": false},
+    {"namespace": "common", "config_key": "whitelist.json", "value": "[\"a\",\"b\"]", "deleted": false}
+  ]
+}
+```
+
+---
+
+## Server 本地模式（开发调试）
+
+本地模式跳过 MySQL 和选主逻辑，直接从 GitHub 拉取配置到内存缓存，适合本地开发和调试。
+
+### 启动方式
+
+```bash
+# 通过 --mode=local 指定本地模式
+go run cmd/server/main.go --mode=local --config config/local.json
+```
+
+### 配置文件
+
+本地模式的配置文件可以同时包含 `github` 和 `database` 段，但只有 `github` 段会被使用：
+
+```json
+{
+  "github": {
+    "token": "ghp_xxxxxxxxxxxx",
+    "owner": "chunhui204",
+    "repo": "ads-dynamic-config",
+    "branch": "main",
+    "root_path": "configs",
+    "base_url": "https://api.github.com"
+  },
+  "cache_refresh_interval": "10s"
+}
+```
+
+也可以通过环境变量覆盖（优先级高于配置文件）：
+
+| 环境变量 | 说明 |
+|---------|------|
+| `GITHUB_TOKEN` | GitHub PAT |
+| `GITHUB_OWNER` | 仓库 owner |
+| `GITHUB_REPO` | 仓库名 |
+| `GITHUB_BRANCH` | 分支名，默认 `main` |
+| `GITHUB_CONFIG_ROOT` | 配置根目录 |
+
+### 与 MySQL 模式的区别
+
+| 特性 | MySQL 模式（默认） | 本地模式（`--mode=local`） |
+|------|-------------------|--------------------------|
+| 连接 MySQL | 是 | 否 |
+| 选主同步 | 是（Leader 写 MySQL） | 否 |
+| 配置来源 | MySQL（Leader 从 GitHub 同步） | 直连 GitHub |
+| 需要 `INSTANCE_NAME` | 是 | 否 |
+| HTTP API | 是 | 是 |
+| 适用场景 | 生产部署 | 本地开发/调试 |
 
 ---
 
@@ -315,6 +412,8 @@ docker logs -f config-server-1
 
 ```go
 import "github_based_config_proxy/client_sdk"
+
+// 仅在直连 MySQL 模式下需要导入驱动；通过 Config Server（HTTP）获取配置时不需要
 import _ "github.com/go-sql-driver/mysql"
 ```
 
@@ -344,140 +443,77 @@ type ChannelConfig struct {
 }
 ```
 
-### 3. 初始化 SDK（完整示例）
+### 3. 初始化 SDK
+
+**推荐方式：通过 Config Server 获取配置（不直连 MySQL）**
 
 ```go
-package main
+// 配置多个 Server 地址，SDK 自动轮询 + 故障转移
+configClient, err := client_sdk.NewClientWithServer([]string{
+    "http://10.0.0.1:8080",
+    "http://10.0.0.2:8080",
+})
+if err != nil {
+    return err
+}
+```
 
-import (
-    "context"
-    "database/sql"
-    "log"
-    "net/http"
-    "os"
-    "os/signal"
-    "strconv"
-    "syscall"
-    "time"
+也可以通过 `Config` 自定义超时和冷却参数：
 
-    "github_based_config_proxy/client_sdk"
+```go
+configClient, err := client_sdk.NewClient(client_sdk.Config{
+    ServerAddrs:     []string{"http://10.0.0.1:8080", "http://10.0.0.2:8080"},
+    HTTPTimeout:     3 * time.Second,  // 单次 HTTP 请求超时
+    FailBackoff:     30 * time.Second, // 故障节点冷却时长
+    RefreshInterval: 1 * time.Minute,
+    MaxCacheTTL:     5 * time.Minute,
+})
+```
 
-    _ "github.com/go-sql-driver/mysql"
-)
+**备选方式：直连 MySQL（向后兼容）**
 
-// 全局配置句柄
-var (
-    configClient *client_sdk.Client
+```go
+// 方式1：SDK 内部创建并管理连接池（简单场景）
+configClient, err := client_sdk.NewClientWithDSN(dsn)
 
-    // 类型安全配置句柄，全局只注册一次
-    riskCfg      *client_sdk.TypedConfig[RiskConfig]
-    whitelistCfg *client_sdk.TypedConfig[[]string]
-    blacklistCfg *client_sdk.TypedConfig[[]BlacklistItem]
-    channelsCfg  *client_sdk.TypedConfig[map[string]ChannelConfig]
-)
+// 方式2：复用业务已有的 *sql.DB（推荐生产环境）
+// db, err := sql.Open("mysql", dsn)
+// configClient, err = client_sdk.NewClient(client_sdk.Config{DB: db})
+```
 
+完整示例（以 Server 模式为主）：
+
+```go
 func initConfig() error {
-    dsn := "hertz_user:HertzUserPass123!@tcp(8.222.145.95:3306)/hertz_db?parseTime=true"
-
-    // ========== 创建 client（二选一） ==========
-    // 方式1：SDK 内部创建并管理连接池（简单场景）
     var err error
-    configClient, err = client_sdk.NewClientWithDSN(dsn)
+    configClient, err = client_sdk.NewClientWithServer([]string{
+        "http://10.0.0.1:8080",
+        "http://10.0.0.2:8080",
+    })
     if err != nil {
         return err
     }
 
-    // 方式2：复用业务已有的 *sql.DB（推荐生产环境，统一连接池管理）
-    // db, err := sql.Open("mysql", dsn)
-    // if err != nil { return err }
-    // db.SetMaxOpenConns(100)
-    // db.SetMaxIdleConns(20)
-    // db.SetConnMaxLifetime(30 * time.Minute)
-    // configClient, err = client_sdk.NewClient(client_sdk.Config{DB: db})
-    // if err != nil { return err }
-
-    // ========== 注册类型安全配置（Init 前后都可以注册） ==========
+    // 注册类型安全配置（Init 前后都可以注册）
     riskCfg = client_sdk.Register[RiskConfig](configClient, "payment", "risk.json")
     whitelistCfg = client_sdk.Register[[]string](configClient, "common", "whitelist.json")
     blacklistCfg = client_sdk.Register[[]BlacklistItem](configClient, "common", "blacklist.json")
     channelsCfg = client_sdk.Register[map[string]ChannelConfig](configClient, "ad", "channels.json")
 
-    // ========== 阻塞预热：从 MySQL 全量加载配置，加载完才算启动完成 ==========
+    // 阻塞预热：全量加载配置
     ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
     defer cancel()
     if err := configClient.Init(ctx); err != nil {
         return err
     }
 
-    // ========== 启动后台自动刷新 goroutine ==========
+    // 启动后台自动刷新
     go func() {
         if err := configClient.Start(context.Background()); err != nil {
             log.Printf("config client refresh stopped: %v", err)
         }
     }()
-
     return nil
-}
-
-func main() {
-    // 初始化配置
-    if err := initConfig(); err != nil {
-        log.Fatalf("init config failed: %v", err)
-    }
-    defer configClient.Close()
-
-    // ========== HTTP 服务中使用配置 ==========
-    mux := http.NewServeMux()
-
-    // 示例1：使用类型安全配置，零反序列化开销
-    mux.HandleFunc("/check-risk", func(w http.ResponseWriter, r *http.Request) {
-        cfg, ok := riskCfg.Get()
-        if !ok {
-            http.Error(w, "config not found", http.StatusInternalServerError)
-            return
-        }
-        if cfg.Enabled {
-            w.Write([]byte("risk check enabled, limit=" + strconv.FormatInt(cfg.Limit, 10)))
-        } else {
-            w.Write([]byte("risk disabled"))
-        }
-    })
-
-    // 示例2：遍历字符串数组配置
-    mux.HandleFunc("/whitelist", func(w http.ResponseWriter, r *http.Request) {
-        wl, ok := whitelistCfg.Get()
-        if !ok {
-            http.Error(w, "config not found", http.StatusInternalServerError)
-            return
-        }
-        for _, item := range wl {
-            _, _ = w.Write([]byte(item + "\n"))
-        }
-    })
-
-    // 示例3：获取原始字符串（兼容旧逻辑）
-    mux.HandleFunc("/raw", func(w http.ResponseWriter, r *http.Request) {
-        raw := configClient.GetConfig("payment", "risk.json")
-        _, _ = w.Write([]byte(raw))
-    })
-
-    // 启动 HTTP 服务
-    server := &http.Server{Addr: ":8080", Handler: mux}
-    go func() {
-        log.Printf("business server starting on :8080")
-        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatalf("server error: %v", err)
-        }
-    }()
-
-    // 优雅关闭
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    <-quit
-    log.Printf("shutting down...")
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-    _ = server.Shutdown(ctx)
 }
 ```
 
@@ -485,10 +521,13 @@ func main() {
 
 | 特性 | 说明 |
 |------|------|
-| **启动预热** | `Init()` 阻塞从 MySQL 全量加载配置，加载完成才算初始化完成，保证业务启动后第一时间能拿到配置 |
-| **轻量版本检查** | 后台每隔 `CLIENT_REFRESH_INTERVAL` 检查一次，TTL 到期后只查 `META` 表一行 `REPO_VERSION`，无配置变化不查配置表 |
+| **双模式连接** | 支持通过 Config Server（HTTP）或直连 MySQL 获取配置；`ServerAddrs` 非空时自动使用 HTTP 模式，否则使用 MySQL 模式 |
+| **多节点故障转移** | HTTP 模式下配置多个 Server 地址，轮询负载均衡；单节点故障自动冷却（默认 30s）并切换到健康节点，对业务透明 |
+| **启动预热** | `Init()` 阻塞全量加载配置，加载完成才算初始化完成，保证业务启动后第一时间能拿到配置 |
+| **轻量版本检查** | 后台每隔 `RefreshInterval` 检查一次，TTL 到期后只查版本号（Server 模式查 `/api/v1/version`，MySQL 模式查 `REPO_VERSION`），无变化不全量拉取 |
 | **零反序列化开销** | `Register[T]` 注册的类型配置，只在版本变化时反序列化一次，`Get()` 直接取预解析好的对象，业务调用无任何解析开销 |
-| **自动降级** | 运行期 MySQL 查询失败时继续使用本地旧缓存，不影响业务读取；只有启动阶段 MySQL 不可用才会 Init 失败 |
+| **多级自动降级** | 运行期所有 Server/MySQL 不可用时，继续使用本地旧缓存无限期服务；前 `MaxCacheTTL`（默认 5m）静默不重试，之后每 `RefreshInterval`（默认 1m）重试一次；只有启动阶段数据源不可用才会 Init 失败 |
+| **降级状态可观测** | `IsDegraded() bool` 返回是否处于降级状态，`LastRefreshError() error` 返回最近一次刷新错误，可接入监控告警 |
 | **支持任意 JSON 类型** | 支持普通结构体、结构体数组、字符串数组、Map 等所有 `json.Unmarshal` 支持的类型 |
 | **并发安全** | 配置快照整体原子替换，业务调用无锁，支持高并发读取 |
 | **只读对象** | `Get()` 返回的对象不要修改，否则会污染缓存 |
@@ -521,23 +560,45 @@ workflow 文件内容见本仓库 [.github/workflows/config-repo-validate.yml](.
 ```text
 .
 ├── cmd/
-│   ├── server/          # Config Server 主入口
+│   ├── server/          # Config Server 主入口（支持 --mode=mysql/local）
 │   └── local_verify/    # 本地验证工具
-├── server/              # Server 同步逻辑、MySQL 存储、GitHub API 客户端
+├── server/              # Server 核心逻辑
+│   ├── cache.go         # 内存缓存（ConfigCache，RWMutex 保护）
+│   ├── cache_refresher.go  # 定期从数据源刷新缓存
+│   ├── snapshot_reader.go  # 快照读取抽象（SnapshotReader 接口）
+│   ├── github_snapshot_reader.go  # 直连 GitHub 的快照读取器（本地模式）
+│   ├── handler.go       # HTTP API handler
+│   ├── syncer.go        # GitHub → MySQL 增量同步 + 选主
+│   ├── store.go         # MySQL 存储层（实现 SnapshotReader）
+│   ├── config.go        # Server 配置加载与校验
+│   └── github.go        # GitHub API 客户端
 ├── client_sdk/          # Go Client SDK
+│   ├── client.go        # Client 核心（缓存、刷新、类型注册、降级状态）
+│   ├── http_store.go    # HTTP Store（多节点轮询 + 失败冷却 + 故障转移）
+│   ├── store.go         # Store 接口 + MySQL Store
+│   ├── local.go         # LocalFileStore + DumpAllConfig（离线测试）
+│   ├── types.go         # Snapshot/ConfigIdentity/ConfigItem
+│   └── config.go        # SDK Config
 ├── config/
-│   ├── server.json.example   # MySQL 连接配置模板（参考）
-│   └── server.json           # 实际配置文件（.gitignore，不提交到仓库）
+│   └── server.json.example   # MySQL 连接配置模板（参考）
 ├── .github/workflows/
 │   ├── deploy.yml                  # Server 自动部署 workflow
 │   └── config-repo-validate.yml    # 配置仓库 JSON 校验 workflow（复制到配置仓库）
 ├── Dockerfile
 ├── docker-compose.yml
+├── ENGINEERING_PLAN.md   # 工程方案文档
 └── README.md
 ```
 
 ## 环境变量依赖
 
-| 环境变量 | 必填 | 说明 |
-|---------|------|------|
-| `INSTANCE_NAME` | 是 | Server 容器唯一实例名，多实例部署必须唯一；Client SDK 不依赖任何环境变量 |
+| 环境变量 | 模式 | 必填 | 说明 |
+|---------|------|------|------|
+| `INSTANCE_NAME` | MySQL 模式 | 是 | Server 容器唯一实例名，多实例部署必须唯一 |
+| `GITHUB_TOKEN` | 本地模式 | 是 | GitHub PAT（也可在配置文件 github.token 中设置） |
+| `GITHUB_OWNER` | 本地模式 | 是 | GitHub 仓库 owner |
+| `GITHUB_REPO` | 本地模式 | 是 | GitHub 仓库名 |
+| `GITHUB_BRANCH` | 本地模式 | 否 | 分支名，默认 `main` |
+| `GITHUB_CONFIG_ROOT` | 本地模式 | 是 | 配置文件根目录 |
+
+Client SDK 不依赖任何环境变量，所有配置通过代码传入。

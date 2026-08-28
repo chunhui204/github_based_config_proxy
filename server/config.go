@@ -163,6 +163,12 @@ func (c Config) InstanceID() string {
 }
 
 func (c Config) ListenAddr() string {
+	if addr := strings.TrimSpace(os.Getenv("LISTEN_ADDR")); addr != "" {
+		return normalizeListenAddr(addr)
+	}
+	if port := strings.TrimSpace(os.Getenv("HTTP_PORT")); port != "" {
+		return normalizeListenAddr(port)
+	}
 	return ":" + DefaultHTTPPort
 }
 
@@ -262,4 +268,18 @@ func parseDuration(value string) time.Duration {
 		return 0
 	}
 	return duration
+}
+
+func normalizeListenAddr(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ":" + DefaultHTTPPort
+	}
+	if strings.HasPrefix(value, ":") {
+		return value
+	}
+	if strings.Contains(value, ":") {
+		return value
+	}
+	return ":" + value
 }

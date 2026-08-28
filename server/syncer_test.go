@@ -138,6 +138,7 @@ func newTestSyncer(t *testing.T, store *fakeStore, github *fakeGitHub) *Syncer {
 
 type fakeGitHub struct {
 	head      string
+	headErr   error
 	files     []GitHubFile
 	content   map[string][]byte
 	headCalls int
@@ -146,7 +147,7 @@ type fakeGitHub struct {
 
 func (g *fakeGitHub) GetHeadCommit(context.Context) (string, error) {
 	g.headCalls++
-	return g.head, nil
+	return g.head, g.headErr
 }
 
 func (g *fakeGitHub) ListFiles(context.Context, string) ([]GitHubFile, error) {

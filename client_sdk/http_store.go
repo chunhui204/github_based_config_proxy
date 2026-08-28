@@ -110,31 +110,33 @@ func (s *HTTPStore) doRequest(ctx context.Context, path string, out any) error {
 		return fmt.Errorf("no server endpoints configured")
 	}
 
+	// start 记录本次遍历的起始位置，遍历过程中不修改 s.current，
+	// 避免失败后重新加锁时游标被重复推进导致跳过节点。
+	start := s.current
 	now := time.Now()
-	// 从当前游标开始，遍历所有节点，跳过冷却期内的
 	var lastErr error
+
 	for i := 0; i < len(s.endpoints); i++ {
-		idx := (s.current + i) % len(s.endpoints)
+		idx := (start + i) % len(s.endpoints)
 		endpoint := s.endpoints[idx]
 
 		if until, ok := s.failUntil[endpoint]; ok && now.Before(until) {
 			continue
 		}
 
-		// 推进游标到下一个节点，下次请求从下一个开始
+		// 推进全局游标：下次请求从当前节点的下一个开始轮询
 		s.current = (idx + 1) % len(s.endpoints)
 		s.mu.Unlock()
 
 		err := s.fetchJSON(ctx, endpoint+path, out)
 		if err == nil {
-			// 请求成功，清除该节点的失败记忆
 			s.markSuccess(endpoint)
 			return nil
 		}
 		lastErr = err
 		s.markFailed(endpoint)
 
-		// 重新加锁，继续尝试下一个节点
+		// 重新加锁，继续遍历剩余节点
 		s.mu.Lock()
 		now = time.Now()
 	}
