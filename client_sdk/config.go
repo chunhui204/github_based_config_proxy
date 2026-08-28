@@ -18,6 +18,13 @@ type Config struct {
 	// DB 业务自己已有的 *sql.DB，优先复用；为 nil 时使用 DBConfig 由 SDK 内部创建
 	DB              *sql.DB
 	DBConfig        *DBConfig
+	// ServerAddrs Config Server 的 HTTP 地址列表（如 ["http://10.0.0.1:8080", "http://10.0.0.2:8080"]）。
+	// 非空时 SDK 通过 HTTP 请求 Server 获取配置，不直连 MySQL；DB/DBConfig 字段被忽略。
+	ServerAddrs     []string
+	// HTTPTimeout 单次 HTTP 请求超时（仅 ServerAddrs 模式生效）。
+	HTTPTimeout     time.Duration
+	// FailBackoff 节点失败后冷却时长（仅 ServerAddrs 模式生效）。
+	FailBackoff     time.Duration
 	RefreshInterval time.Duration
 	MaxCacheTTL     time.Duration
 }
@@ -43,11 +50,20 @@ func (c *Config) SetDefaults() {
 }
 
 func (c Config) Validate() error {
-	if c.DB == nil && c.DBConfig == nil {
-		return errors.New("either DB or DBConfig is required")
+	hasDB := c.DB != nil || c.DBConfig != nil
+	hasServer := len(c.ServerAddrs) > 0
+	if !hasDB && !hasServer {
+		return errors.New("either DB/DBConfig or ServerAddrs is required")
 	}
 	if c.DBConfig != nil && c.DBConfig.DSN == "" {
 		return errors.New("DBConfig.DSN is required")
+	}
+	if hasServer {
+		for _, addr := range c.ServerAddrs {
+			if addr == "" {
+				return errors.New("ServerAddrs contains empty address")
+			}
+		}
 	}
 	if c.RefreshInterval <= 0 {
 		return errors.New("refresh interval must be positive")

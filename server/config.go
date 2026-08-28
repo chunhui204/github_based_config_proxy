@@ -13,19 +13,22 @@ const (
 	DefaultGitHubBaseURL = "https://api.github.com"
 	DefaultLockName      = "GITHUB_CONFIG_SYNC"
 	DefaultHTTPPort      = "8080"
+	ModeMySQL            = "mysql"
+	ModeLocal            = "local"
 )
 
 type Config struct {
-	GitHubToken    string
-	GitHubOwner    string
-	GitHubRepo     string
-	GitHubBranch   string
-	GitHubRootPath string
-	GitHubBaseURL  string
-	SyncInterval   time.Duration
-	LockLeaseTTL   time.Duration
-	Database       DatabaseConfig
-	Client         ClientConfig
+	GitHubToken          string
+	GitHubOwner          string
+	GitHubRepo           string
+	GitHubBranch         string
+	GitHubRootPath       string
+	GitHubBaseURL        string
+	SyncInterval         time.Duration
+	LockLeaseTTL         time.Duration
+	CacheRefreshInterval time.Duration
+	Database             DatabaseConfig
+	Client               ClientConfig
 }
 
 type ClientConfig struct {
@@ -57,6 +60,62 @@ type FileConfig struct {
 		MaxIdleConns    int    `json:"max_idle_conns"`
 		ConnMaxLifetime string `json:"conn_max_lifetime"`
 	} `json:"database"`
+	GitHub struct {
+		Token    string `json:"token"`
+		Owner    string `json:"owner"`
+		Repo     string `json:"repo"`
+		Branch   string `json:"branch"`
+		RootPath string `json:"root_path"`
+		BaseURL  string `json:"base_url"`
+	} `json:"github"`
+	CacheRefreshInterval string `json:"cache_refresh_interval"`
+}
+
+// NewLocalConfigFromFile 从配置文件和环境变量加载本地模式配置。
+// 本地模式不连 MySQL、不选主，直接从 GitHub 拉取配置到内存。
+// 环境变量（GITHUB_TOKEN/GITHUB_OWNER/GITHUB_REPO/GITHUB_BRANCH/GITHUB_CONFIG_ROOT）
+// 优先级高于配置文件。
+func NewLocalConfigFromFile(filePath string) (Config, error) {
+	cfg := Config{}
+	if filePath != "" {
+		data, err := os.ReadFile(filePath)
+		if err != nil && !os.IsNotExist(err) {
+			return Config{}, err
+		}
+		if err == nil {
+			var fileConfig FileConfig
+			if err := json.Unmarshal(data, &fileConfig); err != nil {
+				return Config{}, err
+			}
+			cfg.GitHubToken = fileConfig.GitHub.Token
+			cfg.GitHubOwner = fileConfig.GitHub.Owner
+			cfg.GitHubRepo = fileConfig.GitHub.Repo
+			cfg.GitHubBranch = fileConfig.GitHub.Branch
+			cfg.GitHubRootPath = fileConfig.GitHub.RootPath
+			cfg.GitHubBaseURL = fileConfig.GitHub.BaseURL
+			cfg.CacheRefreshInterval = parseDuration(fileConfig.CacheRefreshInterval)
+		}
+	}
+
+	// 环境变量覆盖配置文件
+	if v := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); v != "" {
+		cfg.GitHubToken = v
+	}
+	if v := strings.TrimSpace(os.Getenv("GITHUB_OWNER")); v != "" {
+		cfg.GitHubOwner = v
+	}
+	if v := strings.TrimSpace(os.Getenv("GITHUB_REPO")); v != "" {
+		cfg.GitHubRepo = v
+	}
+	if v := strings.TrimSpace(os.Getenv("GITHUB_BRANCH")); v != "" {
+		cfg.GitHubBranch = v
+	}
+	if v := strings.TrimSpace(os.Getenv("GITHUB_CONFIG_ROOT")); v != "" {
+		cfg.GitHubRootPath = v
+	}
+
+	cfg.SetDefaults()
+	return cfg, nil
 }
 
 func NewConfigFromFile(filePath string) (Config, error) {
@@ -82,6 +141,7 @@ func NewConfigFromFile(filePath string) (Config, error) {
 			MaxIdleConns:    fileConfig.Database.MaxIdleConns,
 			ConnMaxLifetime: parseDuration(fileConfig.Database.ConnMaxLifetime),
 		},
+		CacheRefreshInterval: parseDuration(fileConfig.CacheRefreshInterval),
 	}
 	cfg.SetDefaults()
 	return cfg, nil
@@ -128,6 +188,9 @@ func (c *Config) SetDefaults() {
 	if c.LockLeaseTTL <= 0 {
 		c.LockLeaseTTL = 2 * c.SyncInterval
 	}
+	if c.CacheRefreshInterval <= 0 {
+		c.CacheRefreshInterval = DefaultCacheRefreshInterval
+	}
 	if c.Client.RefreshInterval <= 0 {
 		c.Client.RefreshInterval = time.Minute
 	}
@@ -155,23 +218,36 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.InstanceID()) == "" {
 		return errors.New("INSTANCE_NAME env is required (set via -e INSTANCE_NAME=xxx when starting container)")
 	}
-	if strings.TrimSpace(c.GitHubToken) == "" {
-		return errors.New("github token is required (insert GITHUB_TOKEN into ADS_SERVICE_DYNAMIC_CONFIG_META table first)")
-	}
-	if strings.TrimSpace(c.GitHubOwner) == "" {
-		return errors.New("github owner is required (insert GITHUB_OWNER into meta table)")
-	}
-	if strings.TrimSpace(c.GitHubRepo) == "" {
-		return errors.New("github repo is required (insert GITHUB_REPO into meta table)")
-	}
-	if strings.TrimSpace(c.GitHubRootPath) == "" {
-		return errors.New("github root path is required (insert GITHUB_CONFIG_ROOT into meta table)")
+	if err := c.validateGitHub(); err != nil {
+		return err
 	}
 	if c.SyncInterval <= 0 {
 		return errors.New("sync interval must be positive")
 	}
 	if c.LockLeaseTTL <= 0 {
 		return errors.New("lock lease ttl must be positive")
+	}
+	return nil
+}
+
+// ValidateLocal 校验本地模式配置。
+// 本地模式不需要 INSTANCE_NAME（不选主）、不需要 MySQL、不需要锁配置。
+func (c Config) ValidateLocal() error {
+	return c.validateGitHub()
+}
+
+func (c Config) validateGitHub() error {
+	if strings.TrimSpace(c.GitHubToken) == "" {
+		return errors.New("github token is required")
+	}
+	if strings.TrimSpace(c.GitHubOwner) == "" {
+		return errors.New("github owner is required")
+	}
+	if strings.TrimSpace(c.GitHubRepo) == "" {
+		return errors.New("github repo is required")
+	}
+	if strings.TrimSpace(c.GitHubRootPath) == "" {
+		return errors.New("github root path is required")
 	}
 	return nil
 }

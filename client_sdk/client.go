@@ -26,18 +26,26 @@ type Client struct {
 	repoVersion      string
 	initialized      bool
 	lastVersionCheck time.Time
+	lastRefreshErr   error
 	cancel           context.CancelFunc
 }
 
 // NewClient 创建配置客户端。
-// 如果 cfg.DB 不为 nil，复用业务传入的连接池，Close 时不关闭；
-// 如果 cfg.DB 为 nil 且 cfg.DBConfig 不为 nil，由 SDK 内部创建连接池，Close 时自动关闭。
+// 如果 cfg.ServerAddrs 非空，通过 HTTP 请求 Config Server 获取配置（不直连 MySQL）；
+// 否则使用 cfg.DB 或 cfg.DBConfig 直连 MySQL。
 func NewClient(cfg Config) (*Client, error) {
 	cfg.SetDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
+	// ServerAddrs 模式：通过 HTTP 请求 Config Server
+	if len(cfg.ServerAddrs) > 0 {
+		store := NewHTTPStore(cfg.ServerAddrs, cfg.HTTPTimeout, cfg.FailBackoff)
+		return newClient(cfg, store, nil), nil
+	}
+
+	// MySQL 模式：直连数据库
 	var db *sql.DB
 	var closeDB func() error
 	if cfg.DB != nil {
@@ -59,6 +67,12 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 
 	return newClient(cfg, NewMySQLStore(db), closeDB), nil
+}
+
+// NewClientWithServer 创建通过 HTTP 请求 Config Server 的客户端。
+// serverAddrs 为 Server 地址列表，支持多节点轮询和故障转移。
+func NewClientWithServer(serverAddrs []string) (*Client, error) {
+	return NewClient(Config{ServerAddrs: serverAddrs})
 }
 
 // NewClientWithDSN 便捷入口，只传 DSN，SDK 内部使用默认连接池参数创建 db，Close 时自动关闭。
@@ -230,19 +244,43 @@ func (c *Client) refresh(ctx context.Context) error {
 	// 达到 TTL 后只查一行仓库整体版本，避免配置多时扫全表。
 	remoteVersion, err := c.store.GetRepoVersion(ctx)
 	if err != nil {
+		c.setLastRefreshErr(err)
 		return err
 	}
 	if remoteVersion == localVersion {
 		c.updateLastVersionCheck(time.Now())
+		c.setLastRefreshErr(nil)
 		return nil
 	}
 
 	snapshot, err := c.store.LoadSnapshot(ctx)
 	if err != nil {
+		c.setLastRefreshErr(err)
 		return err
 	}
 	c.applySnapshot(snapshot, time.Now())
+	c.setLastRefreshErr(nil)
 	return nil
+}
+
+// IsDegraded 返回当前是否处于降级状态（最近一次刷新失败且有旧缓存）。
+func (c *Client) IsDegraded() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastRefreshErr != nil && c.initialized
+}
+
+// LastRefreshError 返回最近一次刷新的错误，无错误或从未刷新时返回 nil。
+func (c *Client) LastRefreshError() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastRefreshErr
+}
+
+func (c *Client) setLastRefreshErr(err error) {
+	c.mu.Lock()
+	c.lastRefreshErr = err
+	c.mu.Unlock()
 }
 
 func (c *Client) isInitialized() bool {

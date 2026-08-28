@@ -19,6 +19,7 @@ const (
 	MetaKeyGitHubBaseURL         = "GITHUB_BASE_URL"
 	MetaKeySyncInterval          = "SYNC_INTERVAL"
 	MetaKeyLockLeaseTTL          = "LOCK_LEASE_TTL"
+	MetaKeyCacheRefreshInterval  = "CACHE_REFRESH_INTERVAL"
 	MetaKeyClientRefreshInterval = "CLIENT_REFRESH_INTERVAL"
 	MetaKeyClientMaxCacheTTL     = "CLIENT_MAX_CACHE_TTL"
 )
@@ -45,7 +46,7 @@ func (s *MySQLStore) LoadConfigFromMeta(ctx context.Context, cfg Config) (Config
 	rows, err := s.db.QueryContext(ctx, `
 SELECT META_KEY, META_VALUE
 FROM ADS_SERVICE_DYNAMIC_CONFIG_META
-WHERE META_KEY IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+WHERE META_KEY IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		MetaKeyGitHubToken,
 		MetaKeyGitHubOwner,
 		MetaKeyGitHubRepo,
@@ -54,6 +55,7 @@ WHERE META_KEY IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		MetaKeyGitHubBaseURL,
 		MetaKeySyncInterval,
 		MetaKeyLockLeaseTTL,
+		MetaKeyCacheRefreshInterval,
 		MetaKeyClientRefreshInterval,
 		MetaKeyClientMaxCacheTTL,
 	)
@@ -234,6 +236,52 @@ FROM ADS_SERVICE_DYNAMIC_CONFIG_CURRENT`)
 	return records, rows.Err()
 }
 
+// GetRepoVersion 查询 META 表中的全局仓库版本号（REPO_VERSION = GitHub commit SHA）。
+// Server 缓存刷新时先查版本号，版本不变则跳过全量加载，避免频繁扫配置表。
+func (s *MySQLStore) GetRepoVersion(ctx context.Context) (string, error) {
+	var repoVersion string
+	err := s.db.QueryRowContext(ctx, `
+SELECT META_VALUE
+FROM ADS_SERVICE_DYNAMIC_CONFIG_META
+WHERE META_KEY = ?
+LIMIT 1`, MetaKeyRepoVersion).Scan(&repoVersion)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return repoVersion, err
+}
+
+// LoadSnapshot 全量加载当前所有未删除的配置项，供 Server 本地缓存使用。
+func (s *MySQLStore) LoadSnapshot(ctx context.Context) (CacheSnapshot, error) {
+	repoVersion, err := s.GetRepoVersion(ctx)
+	if err != nil {
+		return CacheSnapshot{}, err
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+SELECT NAMESPACE, CONFIG_KEY, CONTENT, DELETED
+FROM ADS_SERVICE_DYNAMIC_CONFIG_CURRENT
+WHERE DELETED = 0`)
+	if err != nil {
+		return CacheSnapshot{}, err
+	}
+	defer rows.Close()
+
+	items := make(map[ConfigIdentity]CachedItem)
+	for rows.Next() {
+		var identity ConfigIdentity
+		var item CachedItem
+		if err := rows.Scan(&identity.Namespace, &identity.ConfigKey, &item.Value, &item.Deleted); err != nil {
+			return CacheSnapshot{}, err
+		}
+		items[identity] = item
+	}
+	if err := rows.Err(); err != nil {
+		return CacheSnapshot{}, err
+	}
+	return CacheSnapshot{RepoVersion: repoVersion, Items: items}, nil
+}
+
 func writeConfigTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -303,6 +351,10 @@ func applyConfigMeta(cfg *Config, key, value string) {
 	case MetaKeyLockLeaseTTL:
 		if d, err := time.ParseDuration(value); err == nil && d > 0 {
 			cfg.LockLeaseTTL = d
+		}
+	case MetaKeyCacheRefreshInterval:
+		if d, err := time.ParseDuration(value); err == nil && d > 0 {
+			cfg.CacheRefreshInterval = d
 		}
 	case MetaKeyClientRefreshInterval:
 		if d, err := time.ParseDuration(value); err == nil && d > 0 {

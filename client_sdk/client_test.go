@@ -3,6 +3,8 @@ package client_sdk
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -417,4 +419,91 @@ func cloneSnapshot(source Snapshot) Snapshot {
 		items[identity] = item
 	}
 	return Snapshot{RepoVersion: source.RepoVersion, Items: items}
+}
+
+func TestLocalFileStoreLoadSnapshot(t *testing.T) {
+	dir := t.TempDir()
+
+	// 模拟 DumpAllConfig 生成的目录结构
+	mustMkdir(t, filepath.Join(dir, "payment"))
+	mustWrite(t, filepath.Join(dir, "payment", "risk.json"), `{"enabled":true}`)
+	mustMkdir(t, filepath.Join(dir, "common"))
+	mustWrite(t, filepath.Join(dir, "common", "whitelist.json"), `["a","b"]`)
+	mustWrite(t, filepath.Join(dir, repoVersionFileName), "abc123")
+
+	store := NewLocalFileStore(dir)
+	ctx := context.Background()
+
+	version, err := store.GetRepoVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != "abc123" {
+		t.Fatalf("version=%q, want abc123", version)
+	}
+
+	snapshot, err := store.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.RepoVersion != "abc123" {
+		t.Fatalf("snapshot version=%q", snapshot.RepoVersion)
+	}
+	if len(snapshot.Items) != 2 {
+		t.Fatalf("items count=%d, want 2", len(snapshot.Items))
+	}
+
+	val, ok := snapshot.Items[ConfigIdentity{Namespace: "payment", ConfigKey: "risk.json"}]
+	if !ok || val.Value != `{"enabled":true}` {
+		t.Fatalf("unexpected item: %+v", val)
+	}
+}
+
+func TestLocalFileStoreDefaultsVersionWhenNoFile(t *testing.T) {
+	dir := t.TempDir()
+	store := NewLocalFileStore(dir)
+
+	version, err := store.GetRepoVersion(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != "local" {
+		t.Fatalf("version=%q, want local", version)
+	}
+}
+
+func TestLocalFileStoreWorksWithClient(t *testing.T) {
+	dir := t.TempDir()
+	mustMkdir(t, filepath.Join(dir, "payment"))
+	mustWrite(t, filepath.Join(dir, "payment", "risk.json"), `{"enabled":true,"limit":99}`)
+
+	store := NewLocalFileStore(dir)
+	client, err := NewClientWithStore(store, time.Minute, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	riskCfg := Register[RiskConfig](client, "payment", "risk.json")
+	if err := client.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	val, ok := riskCfg.Get()
+	if !ok || !val.Enabled || val.Limit != 99 {
+		t.Fatalf("unexpected typed config: %+v ok=%v", val, ok)
+	}
+}
+
+func mustMkdir(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }

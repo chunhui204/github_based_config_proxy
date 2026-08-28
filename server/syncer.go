@@ -87,7 +87,7 @@ func (s *Syncer) SyncOnce(ctx context.Context) error {
 }
 
 func (s *Syncer) collectChanges(ctx context.Context, commitSHA string) ([]SyncConfigItem, []DeletedConfigItem, error) {
-	files, err := s.github.ListFiles(ctx, commitSHA)
+	configs, err := ListGitHubConfigs(ctx, s.github, s.repo.RootPath, commitSHA)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -96,54 +96,29 @@ func (s *Syncer) collectChanges(ctx context.Context, commitSHA string) ([]SyncCo
 		return nil, nil, err
 	}
 
-	seen := make(map[ConfigIdentity]struct{}, len(files))
-	upserts := make([]SyncConfigItem, 0)
-	for _, file := range files {
-		identity, ok := IdentityFromGitHubPath(s.repo.RootPath, file.Path)
-		if !ok {
+	upserts := make([]SyncConfigItem, 0, len(configs))
+	for identity, cfg := range configs {
+		contentHash := ContentHash(cfg.Content)
+		record := current[identity]
+		if !record.Deleted && record.ContentHash == contentHash {
 			continue
 		}
-		seen[identity] = struct{}{}
-		item, changed, err := s.buildUpsert(ctx, file.Path, identity, commitSHA, current[identity])
-		if err != nil {
-			return nil, nil, err
-		}
-		if changed {
-			upserts = append(upserts, item)
-		}
+		upserts = append(upserts, SyncConfigItem{
+			Identity:        identity,
+			Path:            cfg.Path,
+			Content:         string(cfg.Content),
+			ContentHash:     contentHash,
+			GitHubCommitSHA: commitSHA,
+		})
 	}
-	return upserts, collectDeleted(s.repo.RootPath, commitSHA, current, seen), nil
-}
-
-func (s *Syncer) buildUpsert(
-	ctx context.Context,
-	filePath string,
-	identity ConfigIdentity,
-	commitSHA string,
-	current CurrentRecord,
-) (SyncConfigItem, bool, error) {
-	content, err := s.github.GetFileContent(ctx, filePath, commitSHA)
-	if err != nil {
-		return SyncConfigItem{}, false, err
-	}
-	contentHash := ContentHash(content)
-	if !current.Deleted && current.ContentHash == contentHash {
-		return SyncConfigItem{}, false, nil
-	}
-	return SyncConfigItem{
-		Identity:        identity,
-		Path:            filePath,
-		Content:         string(content),
-		ContentHash:     contentHash,
-		GitHubCommitSHA: commitSHA,
-	}, true, nil
+	return upserts, collectDeleted(s.repo.RootPath, commitSHA, current, configs), nil
 }
 
 func collectDeleted(
 	rootPath string,
 	commitSHA string,
 	current map[ConfigIdentity]CurrentRecord,
-	seen map[ConfigIdentity]struct{},
+	configs map[ConfigIdentity]FetchedConfig,
 ) []DeletedConfigItem {
 	deletes := make([]DeletedConfigItem, 0)
 	for identity, record := range current {
@@ -153,7 +128,7 @@ func collectDeleted(
 		if _, ok := IdentityFromGitHubPath(rootPath, record.Path); !ok {
 			continue
 		}
-		if _, ok := seen[identity]; ok {
+		if _, ok := configs[identity]; ok {
 			continue
 		}
 		deletes = append(deletes, DeletedConfigItem{
