@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudwego/hertz/pkg/common/hlog"
 	_ "github.com/go-sql-driver/mysql"
 )
 
@@ -152,10 +153,15 @@ func (c *Client) Init(ctx context.Context) error {
 	})
 	if err == nil {
 		c.applyMetaConfig(metaConfig)
+	} else if len(c.cfg.ServerAddrs) > 0 {
+		hlog.CtxWarnf(ctx, "config sdk load server meta config failed, use local defaults: err=%v", err)
 	}
 
 	snapshot, err := c.store.LoadSnapshot(ctx)
 	if err != nil {
+		if len(c.cfg.ServerAddrs) > 0 {
+			hlog.CtxWarnf(ctx, "config sdk load server snapshot failed during init: err=%v", err)
+		}
 		return err
 	}
 	c.applySnapshot(snapshot, time.Now())
@@ -250,13 +256,14 @@ func (c *Client) refresh(ctx context.Context) error {
 	}
 	if err := c.serverCircuitOpenError(now); err != nil {
 		c.setLastRefreshErr(err)
+		hlog.CtxWarnf(ctx, "config sdk server circuit breaker is open, skip server request and use local cache: err=%v", err)
 		return err
 	}
 
 	// 达到 TTL 后只查一行仓库整体版本，避免配置多时扫全表。
 	remoteVersion, err := c.store.GetRepoVersion(ctx)
 	if err != nil {
-		return c.recordRefreshFailure(err, time.Now())
+		return c.recordRefreshFailure(ctx, "get_repo_version", err, time.Now())
 	}
 	if remoteVersion == localVersion {
 		c.updateLastVersionCheck(time.Now())
@@ -266,7 +273,7 @@ func (c *Client) refresh(ctx context.Context) error {
 
 	snapshot, err := c.store.LoadSnapshot(ctx)
 	if err != nil {
-		return c.recordRefreshFailure(err, time.Now())
+		return c.recordRefreshFailure(ctx, "load_snapshot", err, time.Now())
 	}
 	c.applySnapshot(snapshot, time.Now())
 	c.recordRefreshSuccess()
@@ -333,29 +340,49 @@ func (c *Client) serverCircuitOpenLocked(now time.Time) bool {
 		now.Before(c.serverCircuit.openUntil)
 }
 
-func (c *Client) recordRefreshFailure(err error, now time.Time) error {
+func (c *Client) recordRefreshFailure(ctx context.Context, stage string, err error, now time.Time) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	c.lastRefreshErr = err
 	if len(c.cfg.ServerAddrs) == 0 {
+		c.mu.Unlock()
 		return err
 	}
 
 	c.serverCircuit.consecutiveFailures++
+	consecutiveFailures := c.serverCircuit.consecutiveFailures
 	if c.serverCircuit.consecutiveFailures < c.cfg.ServerCircuitBreakerFailureThreshold {
+		c.mu.Unlock()
+		hlog.CtxWarnf(
+			ctx,
+			"config sdk server request failed, use local cache: stage=%s consecutive_failures=%d err=%v",
+			stage,
+			consecutiveFailures,
+			err,
+		)
 		return err
 	}
 
 	// 连续失败达到阈值后打开 SDK 级熔断，避免后续刷新反复触发 HTTP 超时。
 	c.serverCircuit.openUntil = now.Add(c.cfg.ServerCircuitBreakerOpenDuration)
+	openUntil := c.serverCircuit.openUntil
 	c.lastRefreshErr = fmt.Errorf(
 		"server request failed %d times, circuit breaker open until %s: %w",
-		c.serverCircuit.consecutiveFailures,
-		c.serverCircuit.openUntil.Format(time.RFC3339Nano),
+		consecutiveFailures,
+		openUntil.Format(time.RFC3339Nano),
 		err,
 	)
-	return c.lastRefreshErr
+	lastRefreshErr := c.lastRefreshErr
+	c.mu.Unlock()
+
+	hlog.CtxWarnf(
+		ctx,
+		"config sdk server request failed, open circuit breaker and use local cache: stage=%s consecutive_failures=%d open_until=%s err=%v",
+		stage,
+		consecutiveFailures,
+		openUntil.Format(time.RFC3339Nano),
+		err,
+	)
+	return lastRefreshErr
 }
 
 func (c *Client) recordRefreshSuccess() {

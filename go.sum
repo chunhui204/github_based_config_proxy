@@ -1,4 +1,6 @@
 filippo.io/edwards25519 v1.1.0 h1:FNf4tywRC1HmFuKW5xopWpigGjJKiJSV0Cqo0cJWDaA=
 filippo.io/edwards25519 v1.1.0/go.mod h1:BxyFTGdWcka3PhytdK4V28tE5sGfRvvvRV7EaN4VDT4=
+github.com/cloudwego/hertz v0.10.6 h1:VXUO0RdycrYOv8x2JgbQCJh2ovTrkRM6tS4isHN9dwI=
+github.com/cloudwego/hertz v0.10.6/go.mod h1:9Kkpj+fpkWLaKEnoil1Mnp/oxWp9iYx/mUk+fViqQ3E=
 github.com/go-sql-driver/mysql v1.8.1 h1:LedoTUt/eveggdHS9qUFC1EFSa8bU2+1pZjSRpvNJ1Y=
 github.com/go-sql-driver/mysql v1.8.1/go.mod h1:wEBSXgmK//2ZFJyE+qWnIsVGmvmEKlqwuVSjsCm7DZg=
