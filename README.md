@@ -462,11 +462,13 @@ if err != nil {
 
 ```go
 configClient, err := client_sdk.NewClient(client_sdk.Config{
-    ServerAddrs:     []string{"http://10.0.0.1:8080", "http://10.0.0.2:8080"},
-    HTTPTimeout:     3 * time.Second,  // 单次 HTTP 请求超时
-    FailBackoff:     30 * time.Second, // 故障节点冷却时长
-    RefreshInterval: 1 * time.Minute,
-    MaxCacheTTL:     5 * time.Minute,
+    ServerAddrs:                           []string{"http://10.0.0.1:8080", "http://10.0.0.2:8080"},
+    HTTPTimeout:                           3 * time.Second,  // 单次 HTTP 请求超时
+    FailBackoff:                           30 * time.Second, // 单节点故障冷却时长
+    ServerCircuitBreakerFailureThreshold:  3,                // 连续失败 3 次后打开 SDK 级熔断
+    ServerCircuitBreakerOpenDuration:      30 * time.Second, // 熔断期间不请求 Server
+    RefreshInterval:                       1 * time.Minute,
+    MaxCacheTTL:                           5 * time.Minute,
 })
 ```
 
@@ -523,11 +525,12 @@ func initConfig() error {
 |------|------|
 | **双模式连接** | 支持通过 Config Server（HTTP）或直连 MySQL 获取配置；`ServerAddrs` 非空时自动使用 HTTP 模式，否则使用 MySQL 模式 |
 | **多节点故障转移** | HTTP 模式下配置多个 Server 地址，轮询负载均衡；单节点故障自动冷却（默认 30s）并切换到健康节点，对业务透明 |
+| **SDK 级熔断** | Server 模式下连续请求失败达到阈值（默认 3 次）后打开熔断；熔断期间直接使用本地缓存，窗口结束后再尝试请求 Server |
 | **启动预热** | `Init()` 阻塞全量加载配置，加载完成才算初始化完成，保证业务启动后第一时间能拿到配置 |
 | **轻量版本检查** | 后台每隔 `RefreshInterval` 检查一次，TTL 到期后只查版本号（Server 模式查 `/api/v1/version`，MySQL 模式查 `REPO_VERSION`），无变化不全量拉取 |
 | **零反序列化开销** | `Register[T]` 注册的类型配置，只在版本变化时反序列化一次，`Get()` 直接取预解析好的对象，业务调用无任何解析开销 |
-| **多级自动降级** | 运行期所有 Server/MySQL 不可用时，继续使用本地旧缓存无限期服务；前 `MaxCacheTTL`（默认 5m）静默不重试，之后每 `RefreshInterval`（默认 1m）重试一次；只有启动阶段数据源不可用才会 Init 失败 |
-| **降级状态可观测** | `IsDegraded() bool` 返回是否处于降级状态，`LastRefreshError() error` 返回最近一次刷新错误，可接入监控告警 |
+| **多级自动降级** | 运行期所有 Server/MySQL 不可用时，继续使用本地旧缓存无限期服务；本地缓存没有对应配置时 `GetConfigOK` 返回 `false`；只有启动阶段数据源不可用才会 Init 失败 |
+| **降级状态可观测** | `IsDegraded() bool` 返回是否处于降级状态，`IsServerCircuitOpen() bool` 返回 Server 熔断是否打开，`LastRefreshError() error` 返回最近一次刷新错误，可接入监控告警 |
 | **支持任意 JSON 类型** | 支持普通结构体、结构体数组、字符串数组、Map 等所有 `json.Unmarshal` 支持的类型 |
 | **并发安全** | 配置快照整体原子替换，业务调用无锁，支持高并发读取 |
 | **只读对象** | `Get()` 返回的对象不要修改，否则会污染缓存 |

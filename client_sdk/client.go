@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -12,6 +13,11 @@ import (
 )
 
 type unmarshalFunc func(value string) (any, error)
+
+type serverCircuitState struct {
+	consecutiveFailures int
+	openUntil           time.Time
+}
 
 type Client struct {
 	cfg   Config
@@ -27,6 +33,7 @@ type Client struct {
 	initialized      bool
 	lastVersionCheck time.Time
 	lastRefreshErr   error
+	serverCircuit    serverCircuitState
 	cancel           context.CancelFunc
 }
 
@@ -236,30 +243,33 @@ func (c *Client) applyMetaConfig(metaConfig MetaConfig) {
 }
 
 func (c *Client) refresh(ctx context.Context) error {
-	localVersion, lastCheck := c.versionState()
-	if time.Since(lastCheck) < c.cfg.MaxCacheTTL {
+	localVersion, lastCheck, maxCacheTTL := c.versionState()
+	now := time.Now()
+	if now.Sub(lastCheck) < maxCacheTTL {
 		return nil
+	}
+	if err := c.serverCircuitOpenError(now); err != nil {
+		c.setLastRefreshErr(err)
+		return err
 	}
 
 	// 达到 TTL 后只查一行仓库整体版本，避免配置多时扫全表。
 	remoteVersion, err := c.store.GetRepoVersion(ctx)
 	if err != nil {
-		c.setLastRefreshErr(err)
-		return err
+		return c.recordRefreshFailure(err, time.Now())
 	}
 	if remoteVersion == localVersion {
 		c.updateLastVersionCheck(time.Now())
-		c.setLastRefreshErr(nil)
+		c.recordRefreshSuccess()
 		return nil
 	}
 
 	snapshot, err := c.store.LoadSnapshot(ctx)
 	if err != nil {
-		c.setLastRefreshErr(err)
-		return err
+		return c.recordRefreshFailure(err, time.Now())
 	}
 	c.applySnapshot(snapshot, time.Now())
-	c.setLastRefreshErr(nil)
+	c.recordRefreshSuccess()
 	return nil
 }
 
@@ -277,6 +287,13 @@ func (c *Client) LastRefreshError() error {
 	return c.lastRefreshErr
 }
 
+// IsServerCircuitOpen 返回 Server 模式下 SDK 级熔断是否处于打开状态。
+func (c *Client) IsServerCircuitOpen() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.serverCircuitOpenLocked(time.Now())
+}
+
 func (c *Client) setLastRefreshErr(err error) {
 	c.mu.Lock()
 	c.lastRefreshErr = err
@@ -289,15 +306,64 @@ func (c *Client) isInitialized() bool {
 	return c.initialized
 }
 
-func (c *Client) versionState() (string, time.Time) {
+func (c *Client) versionState() (string, time.Time, time.Duration) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.repoVersion, c.lastVersionCheck
+	return c.repoVersion, c.lastVersionCheck, c.cfg.MaxCacheTTL
 }
 
 func (c *Client) updateLastVersionCheck(t time.Time) {
 	c.mu.Lock()
 	c.lastVersionCheck = t
+	c.mu.Unlock()
+}
+
+func (c *Client) serverCircuitOpenError(now time.Time) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.serverCircuitOpenLocked(now) {
+		return nil
+	}
+	return fmt.Errorf("server circuit breaker is open until %s", c.serverCircuit.openUntil.Format(time.RFC3339Nano))
+}
+
+func (c *Client) serverCircuitOpenLocked(now time.Time) bool {
+	return len(c.cfg.ServerAddrs) > 0 &&
+		!c.serverCircuit.openUntil.IsZero() &&
+		now.Before(c.serverCircuit.openUntil)
+}
+
+func (c *Client) recordRefreshFailure(err error, now time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.lastRefreshErr = err
+	if len(c.cfg.ServerAddrs) == 0 {
+		return err
+	}
+
+	c.serverCircuit.consecutiveFailures++
+	if c.serverCircuit.consecutiveFailures < c.cfg.ServerCircuitBreakerFailureThreshold {
+		return err
+	}
+
+	// 连续失败达到阈值后打开 SDK 级熔断，避免后续刷新反复触发 HTTP 超时。
+	c.serverCircuit.openUntil = now.Add(c.cfg.ServerCircuitBreakerOpenDuration)
+	c.lastRefreshErr = fmt.Errorf(
+		"server request failed %d times, circuit breaker open until %s: %w",
+		c.serverCircuit.consecutiveFailures,
+		c.serverCircuit.openUntil.Format(time.RFC3339Nano),
+		err,
+	)
+	return c.lastRefreshErr
+}
+
+func (c *Client) recordRefreshSuccess() {
+	c.mu.Lock()
+	c.lastRefreshErr = nil
+	if len(c.cfg.ServerAddrs) > 0 {
+		c.serverCircuit = serverCircuitState{}
+	}
 	c.mu.Unlock()
 }
 

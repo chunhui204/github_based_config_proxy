@@ -169,6 +169,85 @@ func TestDegradedTypedConfigKeepsOldObject(t *testing.T) {
 	}
 }
 
+func TestServerCircuitBreakerSkipsRequestAfterFailureThreshold(t *testing.T) {
+	identity := ConfigIdentity{Namespace: "payment", ConfigKey: "risk.yaml"}
+	store := &fakeClientStore{
+		snapshot: Snapshot{
+			RepoVersion: "v1",
+			Items: map[ConfigIdentity]ConfigItem{
+				identity: {Value: "stable-config"},
+			},
+		},
+		versionErr: errors.New("server down"),
+	}
+	client := newServerModeTestClient(store, 2, time.Hour)
+	if err := client.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		makeVersionCheckExpired(client)
+		if err := client.refresh(context.Background()); err == nil {
+			t.Fatal("expected refresh error")
+		}
+	}
+	if !client.IsServerCircuitOpen() {
+		t.Fatal("server circuit breaker should be open")
+	}
+
+	makeVersionCheckExpired(client)
+	if err := client.refresh(context.Background()); err == nil {
+		t.Fatal("expected circuit breaker error")
+	}
+	if store.versionCalls != 2 {
+		t.Fatalf("version calls=%d, want 2 (request should be skipped while circuit is open)", store.versionCalls)
+	}
+	value, ok := client.GetConfigOK("payment", "risk.yaml")
+	if !ok || value != "stable-config" {
+		t.Fatalf("value=%q ok=%v, want stable-config/true", value, ok)
+	}
+}
+
+func TestServerCircuitBreakerRetriesAfterOpenDuration(t *testing.T) {
+	store := &fakeClientStore{
+		snapshot: Snapshot{
+			RepoVersion: "v1",
+			Items: map[ConfigIdentity]ConfigItem{
+				{Namespace: "ns", ConfigKey: "a.yaml"}: {Value: "old"},
+			},
+		},
+		versionErr: errors.New("server down"),
+	}
+	client := newServerModeTestClient(store, 1, 20*time.Millisecond)
+	if err := client.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	makeVersionCheckExpired(client)
+	if err := client.refresh(context.Background()); err == nil {
+		t.Fatal("expected refresh error")
+	}
+	if !client.IsServerCircuitOpen() {
+		t.Fatal("server circuit breaker should be open")
+	}
+
+	store.versionErr = nil
+	time.Sleep(40 * time.Millisecond)
+	makeVersionCheckExpired(client)
+	if err := client.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if client.IsServerCircuitOpen() {
+		t.Fatal("server circuit breaker should be closed after successful retry")
+	}
+	if client.IsDegraded() {
+		t.Fatal("client should leave degraded state after successful retry")
+	}
+	if store.versionCalls != 2 {
+		t.Fatalf("version calls=%d, want 2", store.versionCalls)
+	}
+}
+
 func TestDegradedBeforeInitReturnsFalse(t *testing.T) {
 	store := &fakeClientStore{}
 	client := newTestClient(t, store)
@@ -177,6 +256,18 @@ func TestDegradedBeforeInitReturnsFalse(t *testing.T) {
 	if client.IsDegraded() {
 		t.Fatal("IsDegraded should be false before Init")
 	}
+}
+
+func newServerModeTestClient(store Store, threshold int, openDuration time.Duration) *Client {
+	cfg := Config{
+		ServerAddrs:                          []string{"http://config-server"},
+		RefreshInterval:                      time.Millisecond,
+		MaxCacheTTL:                          time.Millisecond,
+		ServerCircuitBreakerFailureThreshold: threshold,
+		ServerCircuitBreakerOpenDuration:     openDuration,
+	}
+	cfg.SetDefaults()
+	return newClient(cfg, store, nil)
 }
 
 func TestNewClientWithServer(t *testing.T) {
